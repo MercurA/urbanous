@@ -11,6 +11,10 @@ app = FastAPI(title="Urbanous API")
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://urbanous.vercel.app",
+    "https://urbanous.net",
+    "https://www.urbanous.net",
+    os.getenv("FRONTEND_URL", "https://urbanous.vercel.app") 
 ]
 
 app.add_middleware(
