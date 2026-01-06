@@ -3,6 +3,7 @@ import json
 import httpx
 import google.generativeai as genai
 from bs4 import BeautifulSoup
+import html # For escaping content in f-strings
 import asyncio # Added for digest parallel requests
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
@@ -13,6 +14,7 @@ from database import AsyncSessionLocal
 from database import AsyncSessionLocal
 from models import NewsOutlet, User, Country, CityMetadata
 from dependencies import get_current_user
+import scraper_engine # New Import
 
 from datetime import datetime, timedelta
 import re
@@ -78,78 +80,77 @@ class CityInfoResponse(BaseModel):
     ruling_party: str
     flag_url: Optional[str] = None
     lng: Optional[float] = 0.0
+    lung: Optional[float] = 0.0
     instructions: Optional[str] = None
 
-# --- Helpers ---
+# --- Constants ---
 
-def parse_romanian_date(date_str: str) -> Optional[datetime]:
-    """
-    Parses dates like '29 decembrie 2025', 'Accepts relative time if simple'.
-    """
-    if not date_str: return None
-    
-    # Map RO months
-    ro_months = {
-        "ianuarie": 1, "ian": 1,
-        "februarie": 2, "feb": 2,
-        "martie": 3, "mar": 3,
-        "aprilie": 4, "apr": 4,
-        "mai": 5,
-        "iunie": 6, "iun": 6,
-        "iulie": 7, "iul": 7,
-        "august": 8, "aug": 8,
-        "septembrie": 9, "sept": 9,
-        "octombrie": 10, "oct": 10,
-        "noiembrie": 11, "nov": 11,
-        "decembrie": 12, "dec": 12
-    }
-    
-    text = date_str.lower()
-    
-    # Try Regex for "DD Month YYYY"
-    # match 1-2 digits, space, word, space, 4 digits
-    match = re.search(r'(\d{1,2})\s+([a-z]+)\s+(\d{4})', text)
-    if match:
-        day, month_name, year = match.groups()
-        month = ro_months.get(month_name)
-        if month:
-            try:
-                return datetime(int(year), month, int(day))
-            except: pass
-            
-    # ISO Format fallback
-    try:
-        return datetime.fromisoformat(date_str)
-    except: pass
-    
-    return None
+POLITICS_OPERATIONAL_DEFINITION = """
+Politics label spec (operational)
+Label name: POLITICS
 
-def extract_date_from_url(url: str) -> Optional[datetime]:
-    """
-    Extracts date from URL slugs like /2025/12/29/ or /2025-12-29/.
-    High confidence if found.
-    """
-    if not url: return None
-    
-    # Pattern 1: /YYYY/MM/DD/
-    match_slug = re.search(r'/(\d{4})/(\d{1,2})/(\d{1,2})/', url)
-    if match_slug:
-        y, m, d = match_slug.groups()
-        try:
-             return datetime(int(y), int(m), int(d))
-        except: pass
+Core criterion:
+Assign POLITICS if the primary focus of the article is power, governance, or collective decision-making carried out by political institutions/actors, or the processes that select/control them.
+“Primary focus” = the main story would still be the same if you removed all non-political details; politics is not just a cameo.
 
-    # Pattern 2: YYYY-MM-DD
-    match_iso = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', url)
-    if match_iso:
-         y, m, d = match_iso.groups()
-         # Sanity check year
-         if 2000 < int(y) < 2030:
-             try:
-                 return datetime(int(y), int(m), int(d))
-             except: pass
-             
-    return None
+Include if ANY of these is the main subject:
+A) Government & institutions (domestic)
+- Executive actions: cabinet decisions, ministries, agencies, regulators acting in official capacity
+- Legislature: bills, votes, committees, parliamentary negotiations
+- Public administration: government programs, budgets, procurement policy (not company-specific business news)
+- Local government: mayors, councils, regional authorities, public service governance
+
+B) Elections & party politics
+- Elections, campaigns, polling, debates, candidate selection, coalition talks
+- Party leadership, internal party conflicts when politically consequential
+- Political strategy, messaging, endorsements
+
+C) Public policy (substance + debate)
+- Policy proposals, reforms, regulation, taxation, welfare, healthcare policy, education policy, climate policy, etc.
+- Political conflict over policy (who supports/opposes; parliamentary dynamics; veto threats)
+
+D) Political accountability & legitimacy
+- Resignations, impeachments, no-confidence votes
+- Ethics, corruption, conflicts of interest when tied to governance (not just criminal detail)
+- Constitutional crises, institutional clashes, rule-of-law disputes
+
+E) International politics & diplomacy
+- Treaties, summits, sanctions, foreign policy statements
+- Diplomatic incidents, recognition disputes, geopolitical negotiations
+
+F) Civil liberties & rights as political contestation
+- Protests, civil society actions, strikes when framed around policy/government power
+- Major court rulings when they reshape governance or political rights (elections, constitutional issues)
+
+Exclude (unless politics is clearly primary):
+1) Crime / courts: If it’s mainly “who did what, evidence, trial details,” label CRIME/LAW, not POLITICS. Exception: if the case directly affects governance.
+2) Business / economy: Market moves, company earnings, mergers → BUSINESS. Exception: sanctions, regulation, antitrust, budgets where the policy process is central → POLITICS.
+3) Disasters / weather / accidents: If the focus is the event itself → DISASTER. Exception: political accountability/policy response dominates.
+4) Culture / celebrity: Politicians as celebrities (personal life) → ENTERTAINMENT unless tied to office, campaign, or legitimacy.
+5) Sports: Sports story with a politician quote is still SPORTS unless it becomes policy.
+
+Decision rules:
+Rule P1 — Actor × Action (strong signal): If article contains political actors/institutions AND governance actions, assign POLITICS.
+Rule P2 — Elections/party process (strong signal): If the main content concerns elections, campaigns, polling, coalitions, party leadership, assign POLITICS.
+Rule P3 — Policy conflict frame (medium signal): If the article is structured as policy debate, assign POLITICS.
+Rule P4 — International statecraft (strong signal): If it involves states/IGOs and diplomatic/military/economic coercion instruments, assign POLITICS.
+Rule P5 — “Mention-only” veto: If political entity is mentioned but not central, do NOT assign POLITICS.
+"""
+
+class PoliticsAssessmentRequest(BaseModel):
+    url: str
+    title: str
+    content: Optional[str] = None # Optional, if frontend already has it or we re-fetch
+
+class PoliticsAssessmentResponse(BaseModel):
+    is_politics: bool
+    confidence: int # 0-100
+    reasoning: str
+    labels: List[str] # e.g. ["POLITICS", "HEALTH"]
+
+# --- Helpers (Moved to scraper_engine) ---
+# parse_romanian_date and extract_date_from_url removed from here
+
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -447,13 +448,147 @@ class ArticleMetadata(BaseModel):
     image_url: Optional[str] = None
     date_str: Optional[str] = None
     relevance_score: Optional[int] = 0
-    scores: Optional[Dict[str, int]] = None # Detailed breakdown # New: Calculated score based on keyword overlap
+    scores: Optional[Dict[str, Any]] = {}
+    ai_verdict: Optional[str] = None # New field for AI Title Check status
     
 class DigestResponse(BaseModel):
     digest: str
     articles: List[ArticleMetadata]
     analysis_source: Optional[List[KeywordData]] = []
     analysis_digest: Optional[List[KeywordData]] = []
+
+@router.post("/outlets/assess_article", response_model=PoliticsAssessmentResponse)
+async def assess_article_politics(req: PoliticsAssessmentRequest, current_user: User = Depends(get_current_user)):
+    """
+    Evaluates an article against the operational definition of POLITICS using Gemini.
+    """
+    if not current_user.gemini_api_key:
+        raise HTTPException(status_code=400, detail="Gemini API Key required")
+    
+    genai.configure(api_key=current_user.gemini_api_key)
+    
+    # Needs content. If not provided, fetch it (snippet).
+    article_text = req.content
+    if not article_text or len(article_text) < 100:
+        # Fetch ephemeral
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            try:
+                resp = await client.get(req.url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    # Basic extraction
+                    article_text = soup.get_text(separator=' ', strip=True)[:15000] # Limit context
+            except:
+                article_text = "Content unavailable. Rely on Title."
+
+    prompt = f"""
+    You are an expert political analyst system.
+    Evaluate the following article against the provided OPERATIONAL DEFINITION OF POLITICS.
+    
+    DEFINITION:
+    {POLITICS_OPERATIONAL_DEFINITION}
+    
+    ARTICLE TITLE: {req.title}
+    ARTICLE CONTENT (Snippet):
+    {article_text[:10000]}
+    
+    TASK:
+    1. Determine if this article qualifies as POLITICS based on the inclusion/exclusion criteria.
+    2. Provide a Confidence score (0-100).
+    3. Choose appropriate labels (e.g., POLITICS, BUSINESS, CRIME).
+    4. Provide brief reasoning (max 1 sentence).
+    
+    Return JSON:
+    {{
+        "is_politics": true/false,
+        "confidence": 90,
+        "labels": ["POLITICS", "ECONOMY"],
+        "reasoning": "Primary focus is on government budget approval (Rule P1)."
+    }}
+    """
+    
+    try:
+        model = genai.GenerativeModel('gemini-flash-latest')
+        response = await model.generate_content_async(prompt)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        return PoliticsAssessmentResponse(**data)
+    except Exception as e:
+        print(f"Assessment Error: {e}")
+        return PoliticsAssessmentResponse(is_politics=False, confidence=0, reasoning=f"Error: {str(e)}", labels=[])
+
+# Helper to log to stream from async function
+# We will return a tuple (result_map, error_msg)
+
+
+async def batch_verify_titles_debug(titles_map: Dict[int, str], definition: str, api_key: str) -> tuple[Dict[str, bool], str]:
+    if not api_key:
+        print("DEBUG: missing API key for batch_verify_titles_debug")
+        return {}, "Missing API Key"
+    
+    print(f"DEBUG: Using API Key: {api_key[:4]}...{api_key[-4:]}")
+    genai.configure(api_key=api_key)
+    
+    items_str = "\n".join([f"{idx}. {title}" for idx, title in titles_map.items()])
+    
+    prompt = f"""
+    You are an expert political analyst.
+    Classify the following article titles as "POLITICS" (True) or "NOT POLITICS" (False) based on the provided Operational Definition.
+    
+    DEFINITION:
+    {definition}
+    
+    TITLES:
+    {items_str}
+    
+    TASK:
+    Return a raw JSON object mapping the EXACT PROVIDED ID (e.g. {list(titles_map.keys())[0]}) to a boolean verdict.
+    Do NOT re-index the items. Use the numbers provided in the input list.
+    Example: {{"{list(titles_map.keys())[0]}": true, ...}}
+    
+    STRICTLY RETURN JSON ONLY.
+    """
+    
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = await model.generate_content_async(prompt)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        
+        with open("debug_ai.log", "a") as f:
+             f.write(f"\n--- BATCH ---\nResponse: {text[:200]}...\n")
+
+        # Robust Parsing
+        try:
+            result_map = json.loads(text)
+        except json.JSONDecodeError:
+            # Fallback: Try regex to find JSON-like structure
+            import re
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                result_map = json.loads(match.group(0))
+            else:
+                raise ValueError("Could not extract JSON")
+
+        # Convert all keys to strings for consistent comparison
+        result_map = {str(k): v for k, v in result_map.items()}
+        input_keys = [str(k) for k in titles_map.keys()]
+        
+        # Mismatch Check & Fallback
+        if not any(k in result_map for k in input_keys) and len(result_map) == len(input_keys):
+            with open("debug_ai.log", "a") as f:
+                f.write("Mismatch detected. Applying fallback.\n")
+            # Assume order is preserved
+            result_values = list(result_map.values())
+            result_map = {input_keys[i]: result_values[i] for i in range(len(input_keys))}
+            
+        with open("debug_ai.log", "a") as f:
+             f.write(f"Mapped Keys: {list(result_map.keys())}\n")
+             
+        return result_map, None
+    except Exception as e:
+        with open("debug_ai.log", "a") as f:
+             f.write(f"ERROR: {e}\n")
+        return {}, str(e)
 
 class DigestSaveRequest(BaseModel):
     title: str
@@ -534,20 +669,7 @@ async def get_digest_detail(id: int, db: Session = Depends(get_db)):
         created_at=digest.created_at.isoformat()
     )
 
-@router.post("/outlets/digests/save")
-async def save_digest(req: DigestSaveRequest, db: Session = Depends(get_db)):
-    """Saves a generated digest."""
-    db_digest = NewsDigest(
-        title=req.title,
-        category=req.category,
-        summary_markdown=req.summary_markdown,
-        articles_json=json.dumps([a.dict() for a in req.articles]),
-        analysis_source=json.dumps([k.dict() for k in req.analysis_source]) if req.analysis_source else None,
-        analysis_digest=json.dumps([k.dict() for k in req.analysis_digest]) if req.analysis_digest else None
-    )
-    db.add(db_digest)
-    await db.commit()
-    return {"status": "success", "id": db_digest.id}
+
 
 class CityInfoResponse(BaseModel):
     population: str
@@ -685,22 +807,42 @@ async def robust_fetch(client, url):
         print(f"Fetch error {url}: {e}")
         return None
 
-async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str = "24h") -> dict:
+async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str = "24h", log_bus: any = None) -> dict:
     """
     Fetches content from an outlet, intelligently navigating to the category page if possible.
     Returns structured article data and raw text for AI.
     """
+    
+    async def log(msg: str):
+         if log_bus:
+              await log_bus(msg)
+         print(msg) # Keep stdout
+
+    # 1. Determine Target URL
+    target_url = outlet.url
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
         # 1. Fetch Homepage
-        print(f"[{outlet.name}] Fetching homepage: {outlet.url}")
+        await log(f"[{outlet.name}] Fetching homepage: {outlet.url}")
         resp = await robust_fetch(client, outlet.url)
         if not resp or resp.status_code != 200:
-            return {"text": "", "articles": []}
-
+            code = resp.status_code if resp else "ERR"
+            await log(f"Failed to fetch {target_url}: {code}")
+            return {"articles": [], "raw_text": ""}
+        
+        html_content = resp.text
+        # Encoding fix
+        if resp.encoding and resp.encoding.lower() not in ['utf-8', 'iso-8859-1']:
+             try:
+                 html_content = resp.content.decode(resp.encoding)
+             except:
+                 pass # Fallback to .text auto-decode
+        
+        await log(f"Fetched {len(html_content)} bytes (Encoding: {resp.encoding or 'auto'})")
+        
         final_url = outlet.url
         # Limit HTML size to prevent CPU blocking on huge pages
         html = resp.text[:200000] 
@@ -753,7 +895,7 @@ async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str 
                         elif href.startswith("http"):
                             final_url = href
                         
-                        print(f"[{outlet.name}] Found category link: {final_url}")
+                        await log(f"[{outlet.name}] Found category link: {final_url}")
                         cat_resp = await robust_fetch(client, final_url)
                         if cat_resp and cat_resp.status_code == 200:
                             html = cat_resp.text[:200000] # Limit size
@@ -778,7 +920,7 @@ async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str 
         urls_to_scrape.append(f"{base}/stiri/{kw}") # Common pattern
         urls_to_scrape.append(f"{base}/sectiune/{kw}") # Another pattern
 
-    print(f"DEBUG: Active Scraping for {outlet.name}: {urls_to_scrape}")
+    await log(f"DEBUG: Active Scraping for {outlet.name}: {urls_to_scrape}")
     
     # NEW: Dictionary to aggregate metadata by URL
     candidates_map = {} 
@@ -799,7 +941,7 @@ async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str 
         if i > 3: break 
         
         try:
-            print(f"  -> Fetching: {target_url}")
+            await log(f"  -> Fetching: {target_url}")
             async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client: # Reduced timeout for sub-pages
                 resp = await client.get(target_url, headers=headers)
                 if resp.status_code != 200: continue
@@ -827,8 +969,17 @@ async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str 
                     raw_title = a.get_text(strip=True)
                     
                     # Normalize URL
+                    # Normalize URL
                     if not href.startswith('http'):
-                        full_url = outlet_url.rstrip('/') + '/' + href.lstrip('/')
+                        import urllib.parse
+                        # Use target_url (current page) as base if possible, or outlet_url
+                        # Actually outlet_url (lines 708) might be just the base.
+                        # But href is usually relative to the current path if not absolute.
+                        # Safe bet: urljoin on outlet.url is standard for site-wide crawling if we assume href is from root.
+                        # But if href is relative "article.html", it should generally be joined with target_url.
+                        # HOWEVER, in this loop, target_url changes.
+                        # Let's use urljoin(target_url, href) which is most correct for scraping.
+                        full_url = urllib.parse.urljoin(target_url, href)
                     else:
                         full_url = href
                     
@@ -868,89 +1019,84 @@ async def smart_scrape_outlet(outlet: NewsOutlet, category: str, timeframe: str 
                     ]
                     if any(b in full_url.lower() for b in BLACKLIST_TERMS): is_relevant = False
                     
-                    if is_relevant:
-                        # Attempt Date Parsing from Title (Heuristic for Timestamp Links)
-                        found_date_str = None
-                        import re
-                        # Match YYYY-MM-DD or DD.MM.YYYY or "04 Ian"
-                        date_match = re.search(r'(\d{4}-\d{2}-\d{2})|(\d{1,2}\.\d{2}\.\d{4})|(\d{1,2}\s+(?:Ian|Feb|Mar|Apr|Mai|Iun|Iul|Aug|Sep|Oct|Nov|Dec|Jan))', raw_title, re.IGNORECASE)
-                        
-                        if date_match:
-                             match_str = date_match.group(0)
-                             try:
-                                 if '-' in match_str: found_date_str = match_str
-                                 elif '.' in match_str:
-                                      d, m, y = match_str.split('.')
-                                      found_date_str = f"{y}-{m}-{d}"
-                             except: pass
+                    if any(b in full_url.lower() for b in BLACKLIST_TERMS): is_relevant = False
+                    
+                    # DEBUG: Log logic
+                    # print(f"DEBUG LINK: {full_url} | Relevant: {is_relevant} | Keywords: {cat_keywords}")
 
-                        # Extract from URL capability
-                        def extract_date_from_url(url):
-                            # Supports YYYY/MM/DD, YYYY-MM-DD, YYYY.MM.DD
-                            match = re.search(r'(\d{4})[./-](\d{2})[./-](\d{2})', url)
-                            if match:
-                                try:
-                                    # Normalize to dashes for strptime if needed, or just use parts
-                                    y, m, d = match.groups()
-                                    return datetime(int(y), int(m), int(d))
-                                except ValueError: pass
-                            return None
+                    # 4. Contextual Relevance (NEW)
+                    page_is_category = any(k in target_url.lower() for k in cat_keywords)
+                    
+                    if not is_relevant and page_is_category:
+                         if full_url.count("-") >= 3:
+                             is_relevant = True
+                         elif re.search(r'/\d+/', full_url):
+                             is_relevant = True
+                    
+                    if is_relevant:
+                        print(f"DEBUG: ACCEPTED CANDIDATE {full_url}")
+                    else:
+                        # Log first few rejections to see why
+                        if len(links) < 100 or i < 1: 
+                             pass 
+                             # print(f"DEBUG: REJECTED {full_url} (PageCat: {page_is_category})")
+                        # Attempt Date Parsing - SCAPER ENGINE V2
                         
-                        url_date_obj = extract_date_from_url(full_url)
-                        url_date_str = url_date_obj.strftime("%Y-%m-%d") if url_date_obj else None
+                        # 1. Use the optimized Engine
+                        # We pass the snippet (parent text) as HTML context if needed, or full HTML?
+                        # For efficiency in this loop, we might want to just check URL and Link Text first.
+                        # BUT scraper_engine is designed for FULL HTML page analysis usually.
+                        # Adapted for Discovery Loop:
                         
-                        # NEW: Context Lookbehind (Parent Text)
-                        # Helps when date is "02.01.2026 - Title" plain text before anchor
-                        context_date_str = None
-                        try:
+                        found_date_str = None
+                        
+                        # A. Check URL (Fastest)
+                        url_date_obj = scraper_engine.extract_date_from_url(full_url)
+                        if url_date_obj: 
+                            found_date_str = url_date_obj.strftime("%Y-%m-%d")
+                        
+                        # B. Check Link Text / Parent (Heuristic)
+                        if not found_date_str:
                              parent_text = a.parent.get_text(separator=' ', strip=True)
-                             # Look for DD.MM.YYYY, DD-MM-YYYY, DD Month YYYY
-                             # Using a slightly looser regex to catch "2 Ianuarie 2026" etc
-                             ctx_match = re.search(r'(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})|(\d{1,2})\s+(?:Ian|Feb|Mar|Apr|Mai|Iun|Iul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})', parent_text, re.IGNORECASE)
+                             # Reuse the parse_romanian_date logic which handles various text formats
+                             # We try to extract a date substring first? 
+                             # Actually `parse_romanian_date` is permissive.
+                             # Let's try passing likely candidates.
                              
-                             if ctx_match:
-                                  # Parse if match
-                                  # This is a bit complex to normalize perfectly without a huge heavy libs, 
-                                  # but let's try to grab the YYYY part at least to validate 'freshness'
-                                  # Or just extract the string for now.
-                                  # If it matches strict DD.MM.YYYY:
-                                   m_str = ctx_match.group(0)
-                                   # quick normalize dot
-                                   if '.' in m_str:
-                                        d, m, y = m_str.split('.')
-                                        context_date_str = f"{y}-{m}-{d}"
-                        except: pass
+                             # Heuristic: Check if Parent Text IS a date
+                             d = scraper_engine.parse_romanian_date(parent_text[:50]) # Check start
+                             if d: found_date_str = d.strftime("%Y-%m-%d")
+                             
+                        # C. Check Time Tag in Parent
+                        if not found_date_str:
+                             time_tag = a.find_next("time") or a.find_previous("time") or a.parent.find("time")
+                             if time_tag and time_tag.has_attr("datetime"):
+                                  t_match = re.search(r'(\d{4}-\d{2}-\d{2})', time_tag["datetime"])
+                                  if t_match: found_date_str = t_match.group(1)
 
                         # Merge/Update Logic
                         existing = candidates_map.get(full_url)
                         
                         if existing:
-                             # Heuristic: if found_date_str is present in raw_title, this 'title' is likely just a timestamp
-                             is_timestamp_only = (found_date_str is not None and len(raw_title) < 20)
-                             
-                             if not is_timestamp_only and len(raw_title) > len(existing.title):
-                                 existing.title = raw_title
-                                 
-                             # Update Date if missing
-                             if not existing.date_str:
-                                 if url_date_str: existing.date_str = url_date_str
-                                 elif context_date_str: existing.date_str = context_date_str
-                                 elif found_date_str: existing.date_str = found_date_str
+                              # Update Title if new one is longer (heuristic: longer text = actual headline vs category badge)
+                              if len(raw_title) > len(existing.title):
+                                   existing.title = raw_title
+                              
+                              # Update Date if missing
+                              if not existing.date_str and found_date_str:
+                                  existing.date_str = found_date_str
                         else:
                              # Create New
-                             # Priority: URL > Context (Parent) > Title Match
-                             final_date_str = url_date_str or context_date_str or found_date_str
-                             
                              art = ArticleMetadata(
                                  source=outlet.name,
                                  title=raw_title,
                                  url=full_url,
-                                 date_str=final_date_str
+                                 date_str=found_date_str
                              )
                              candidates_map[full_url] = art
                         
         except Exception as e:
-            print(f"Error scraping {target_url}: {e}")
+            await log(f"Error scraping {target_url}: {e}")
             continue
 
     # Finalize: Convert values to list
@@ -1048,6 +1194,7 @@ async def save_digest(
     current_user: User = Depends(get_current_user)
 ):
     """Save a generated digest to the database."""
+    print(f"DEBUG: Saving digest '{digest.title}' for user {current_user.id}")
     import json
     
     db_digest = NewsDigest(
@@ -1147,73 +1294,439 @@ async def verify_relevance_with_ai(title: str, url: str, category: str, api_key:
         print(f"AI Verification Failed: {e}")
         return True # Fail open to avoid dropping potentially good articles if API fails
 
-async def extract_date_with_ai(html_content: str, url: str, api_key: str) -> Optional[str]:
+# Removed OLD extract_date_with_ai (Moved to scraper_engine)
+
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
+
+@router.post("/outlets/digest/stream")
+async def generate_digest_stream(req: DigestRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Uses Metadata tags first, then Gemini to extract the publication date from the article HTML.
-    Returns YYYY-MM-DD string or None.
+    Streams log updates and final result as NDJSON.
     """
-    try:
-        # 1. Metadata Probe (Deterministic & Fast)
-        soup = BeautifulSoup(html_content, 'html.parser')
+    
+    async def process_stream():
+        # Queue for cross-task communication
+        stream_queue = asyncio.Queue()
         
-        # Candidate tags
-        meta_candidates = [
-            {'property': 'article:published_time'},
-            {'property': 'og:published_time'},
-            {'name': 'date'},
-            {'name': 'pubdate'},
-            {'name': 'original-publish-date'},
-            {'itemprop': 'datePublished'}
+        # Callback wrapper to put logs into queue
+        async def queue_logger(msg: str):
+            await stream_queue.put({"type": "log", "message": msg})
+
+        yield json.dumps({"type": "log", "message": "Initializing Secure Pipeline..."}) + "\n"
+        
+        # 1. Fetch Outlets
+        stmt = select(NewsOutlet).where(NewsOutlet.id.in_(req.outlet_ids))
+        result = await db.execute(stmt)
+        outlets = result.scalars().all()
+        
+        if not outlets:
+             yield json.dumps({"type": "error", "message": "No outlets found"}) + "\n"
+             return
+
+        yield json.dumps({"type": "log", "message": f"Targeting {len(outlets)} sources..."}) + "\n"
+        
+        # WORKER FUNCTION
+        async def scraper_worker():
+            try:
+                all_raw_articles = []
+                for outlet in outlets:
+                     # Pass queue_logger which is Awaitable (not a generator)
+                     res = await smart_scrape_outlet(outlet, req.category, req.timeframe, log_bus=queue_logger)
+                     
+                     if res.get("articles"):
+                          all_raw_articles.extend(res["articles"])
+                          await stream_queue.put({"type": "log", "message": f"Found {len(res['articles'])} articles from {outlet.name}"})
+                
+                # Signal phase change or return data
+                print(f"DEBUG: WORKER FINISHED. Sending {len(all_raw_articles)} articles.")
+                await stream_queue.put({"type": "data", "articles": all_raw_articles})
+            except Exception as e:
+                print(f"DEBUG: WORKER ERROR: {e}")
+                await stream_queue.put({"type": "error", "message": str(e)})
+            finally:
+                await stream_queue.put(None) # Sentinel
+
+        # Start Worker
+        task = asyncio.create_task(scraper_worker())
+        
+        all_articles = []
+        
+        # Consumer Loop
+        while True:
+            item = await stream_queue.get()
+            if item is None:
+                break
+            
+            if item["type"] == "log":
+                yield json.dumps(item) + "\n"
+            elif item["type"] == "error":
+                yield json.dumps(item) + "\n"
+            elif item["type"] == "data":
+                all_articles = item["articles"]
+                print(f"DEBUG: CONSUMER RECEIVED {len(all_articles)} ARTICLES")
+                yield json.dumps({"type": "log", "message": f"Processing {len(all_articles)} raw items..."}) + "\n"
+        
+        print(f"DEBUG: CONSUMER EXITED LOOP. Total Articles: {len(all_articles)}")
+        
+        await task # Ensure clean exit check
+
+        # ... (Rest of logic: Scoring, Rescue, AI)
+        
+        # COPY OF THE DIGEST LOGIC (REFACTORED)
+        
+        yield json.dumps({"type": "log", "message": "Ranking & Scoring Articles..."}) + "\n"
+        
+        # 0. Timeframe Calculation
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        cutoff_date = now - timedelta(days=1) # Default 24h
+        if req.timeframe == "3days":
+            cutoff_date = now - timedelta(days=3)
+        elif req.timeframe == "1week":
+            cutoff_date = now - timedelta(days=7)
+            
+        yield json.dumps({"type": "log", "message": f"Timeframe: {req.timeframe} (Cutoff: {cutoff_date.date()})"}) + "\n"
+
+        candidates_for_ai = []
+        filtered_articles = [] # Final list
+        analysis_source = [] # We skip detailed keyword analysis for stream to save time/quota
+
+        total_scraped = len(all_articles)
+        yield json.dumps({"type": "log", "message": f"Scoring {total_scraped} raw articles..."}) + "\n"
+        
+        # Helper lists
+        BLOCKED_DOMAINS = ["google.com", "apple.com", "youronlinechoices", "facebook.com", "twitter.com", "instagram.com", "tiktok.com", "youtube.com"]
+        SUSPICIOUS_TERMS = [
+            "recipe", "retet", "receta", "recette", "rezept", "ricett", "mancare", "food", "kitchen", "bucatarie", "essen", "cucina",
+            "horoscop", "horoscope", "horoskop", "zodiac", "zodiaque", "astrology",
+            "can-can", "cancan", "paparazzi", "gossip", "tabloid", "klatsch", "potins", "cookie", "gdpr", "privacy", "termeni", "conditii"
         ]
-        
-        for attr in meta_candidates:
-            tag = soup.find('meta', attr)
-            if tag and tag.get('content'):
-                raw_date = tag['content']
-                # Parse ISO format commonly found in meta (e.g. 2026-01-04T12:00:00+02:00)
-                # Use simplified regex for YYYY-MM-DD
-                match = re.search(r'(\d{4}-\d{2}-\d{2})', raw_date)
-                if match:
-                    print(f"  -> Metadata Hit ({attr}): {match.group(1)}")
-                    return match.group(1)
+        NOISE_TERMS = [
+            "apa calda", "apa rece", "intrerupere", "avarie", "curent", "electricitate",
+            "trafic", "restrictii", "accident", "incendiu", "minor", "program",
+            "meteo", "vremea", "prognoza", "cod galben", "cod portocaliu"
+        ]
 
-        # 2. AI Fallback
-        genai.configure(api_key=api_key)
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # DEDUPLICATION SETS
+        seen_urls = set()
+        seen_titles = set()
+        unique_articles = []
         
-        # Truncate HTML to header/metadata/first few paragraphs to save tokens
-        # Usually date is in the first 3000 chars
-        truncated_html = html_content[:4000]
-        
-        prompt = f"""
-        Extract the publication date of this news article.
-        URL: {url}
-        HTML Metadata/Header:
-        {truncated_html}
-        
-        Rules:
-        1. Look for 'published_time', 'date', 'time', or text like "15 Ianuarie 2026", "02.01.2026".
-        2. Return ONLY the date in YYYY-MM-DD format.
-        3. If no date is found, return NULL.
-        """
-        
-        response = await model.generate_content_async(prompt)
-        ans = response.text.strip()
-        if "NULL" in ans: return None
-        return ans
-    except Exception as e:
-        print(f"AI Date Extraction Failed: {e}")
-        return None
+        for article in all_articles:
+             # URL Normalization for Dedupe
+             norm_url = article.url.split("?")[0].rstrip("/")
+             if norm_url in seen_urls: continue
+             
+             # Title Dedupe (Simple lowercasing)
+             norm_title = article.title.lower().strip()
+             if norm_title in seen_titles: continue
+             
+             seen_urls.add(norm_url)
+             seen_titles.add(norm_title)
+             
+             # SPAM BLOCK
+             if any(d in article.url for d in BLOCKED_DOMAINS): continue
+             # CATEGORY BLOCK
+             if "/category/" in article.url or "/page/" in article.url or "/tag/" in article.url or "/eticheta/" in article.url or "/author/" in article.url or "/autor/" in article.url: continue
+            
+             # Find Source Outlet for strict filtering
+             source_outlet = next((o for o in outlets if o.name == article.source), None)
+             if source_outlet and "#" in article.url and article.url.split("#")[0] == source_outlet.url: continue
 
+             # SCORING
+             topic_score = 0
+             title_lower = article.title.lower()
+             url_lower = article.url.lower()
+             
+             # ... (reusing existing scoring logic) ...
+             # Simple heuristic for category matching
+             if req.category.lower() in title_lower or req.category.lower() in url_lower:
+                 topic_score += 30
+                 
+             # Contextual URL Boost
+             cat_stem = req.category.lower()[:4] 
+             if f"/{cat_stem}" in url_lower:
+                  topic_score += 20
+                  
+             # Generic "Admin" boost
+             if req.category in ["Politics", "Admin"]:
+                 if any(k in title_lower for k in ["primar", "consiliu", "presedinte", "ministru", "guvern", "parlament"]):
+                     topic_score += 40
+                 elif any(k in title_lower for k in ["scandal", "acuzatii", "demisie", "alegeri"]):
+                     topic_score += 50
+                 elif "sibi" in title_lower:
+                     topic_score += 10
+             
+             # EXPLICIT PENALTIES
+             if req.category.lower() not in ["local", "general", "all"]:
+                  if any(n in title_lower for n in NOISE_TERMS):
+                      topic_score -= 50
+
+             # Penalize Off-Topic
+             if any(term in title_lower for term in SUSPICIOUS_TERMS) or any(term in url_lower for term in SUSPICIOUS_TERMS):
+                  topic_score -= 100
+             
+             # Date Logic
+             date_score = 0
+             is_within_timeframe = False
+             
+             if article.date_str:
+                  try:
+                      d_obj = datetime.strptime(article.date_str, "%Y-%m-%d")
+                      if d_obj >= cutoff_date:
+                          date_score = 30
+                          is_within_timeframe = True
+                  except: pass
+            
+             total_score = topic_score 
+             
+             # Date Bonus/Penalty
+             if is_within_timeframe:
+                 date_score = 30
+                 total_score += date_score
+             elif article.date_str:
+                 # INVALID DATE (Old) -> Strict Rejection as requested
+                 date_score = 0
+                 total_score = 0 
+             else:
+                 # Undated -> Allow (maybe?) or Strict? 
+                 # User said "check the dates... mark ones outside with red".
+                 # Implies strictly checking KNOWN dates.
+                 # If date is unknown, we can't be sure it's outside.
+                 # Let's keep undated as "neutral" (0 bonus) but ALLOWED if topic is high to avoid empty report again.
+                 date_score = 0
+             
+             article.relevance_score = int(total_score)
+             # Inject Metadata for Frontend
+             article.scores = {
+                 "topic": topic_score, 
+                 "date": date_score, 
+                 "is_fresh": is_within_timeframe,
+                 "is_old": (article.date_str and not is_within_timeframe)
+             }
+             
+             # Filter thresholds (Keep permissive but transparent)
+             # User wants EVERYTHING in the table
+             unique_articles.append(article)
+
+        # AI TITLE PRE-FILTER
+        # Filter logic:
+        # 1. Take top candidates (e.g. all unique_articles which passed heuristic, or top N)
+        # 2. Batch verify titles
+        # 3. Filter out rejections OR Penalize
+        
+        candidates_to_verify = unique_articles # For now verify all that passed basic filters
+        
+        if candidates_to_verify and current_user.gemini_api_key:
+             yield json.dumps({"type": "log", "message": f"🤖 AI Pre-Filtering {len(candidates_to_verify)} titles..."}) + "\n"
+             
+             # Prepare batch (Assign IDs for stability)
+             titles_map = {i: art.title for i, art in enumerate(candidates_to_verify)}
+             
+             # Chunking (Gemini has limits, maybe 50 at a time)
+             chunk_size = 50
+             verified_results = {}
+             
+             title_ids = list(titles_map.keys())
+             for i in range(0, len(title_ids), chunk_size):
+                 chunk_ids = title_ids[i:i+chunk_size]
+                 chunk_map = {k: titles_map[k] for k in chunk_ids}
+                 
+                 res, err = await batch_verify_titles_debug(chunk_map, POLITICS_OPERATIONAL_DEFINITION, current_user.gemini_api_key)
+                 if err:
+                      yield json.dumps({"type": "log", "message": f"⚠️ Batch AI Error: {err}"}) + "\n"
+                 
+                 verified_results.update(res)
+             
+             # Apply verdicts
+             filtered_articles = []
+             # Apply verdicts - NO FILTERING, just tagging
+             for i, art in enumerate(candidates_to_verify):
+                 # Result keys are strings in JSON
+                 verdict = verified_results.get(str(i), verified_results.get(i)) 
+                 
+                 if verdict is True:
+                     # CONFIRMED POLITICS
+                     art.relevance_score += 20 # Bonus
+                     art.ai_verdict = "PASS"
+                 elif verdict is False:
+                     # CONFIRMED NOT POLITICS
+                     art.relevance_score -= 10 # Penalty but keep
+                     art.ai_verdict = "FAIL"
+                 else:
+                     # Error/Missing
+                     art.ai_verdict = "UNKNOWN"
+        else:
+             yield json.dumps({"type": "log", "message": "⚠️ Skipping AI Filter (No API Key or No Candidates)"}) + "\n"
+        
+        # ALL articles go to final list now
+        filtered_articles = unique_articles
+
+        # FINAL COMPILE
+        yield json.dumps({"type": "log", "message": "Compiling HTML Digest..."}) + "\n"
+        
+        # Create HTML Table
+        
+        start_str = cutoff_date.strftime("%b %d")
+        end_str = now.strftime("%b %d")
+        period_label = f"{start_str} - {end_str}"
+        table_html = f"<h1 style='color: #e2e8f0; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px;'>Deep Analysis: {req.category} <span style='font-size:0.6em; color:#94a3b8;'>({period_label})</span></h1>"
+        
+        # Grouping
+        outlet_articles_map = {o.name: [] for o in outlets}
+        for article in filtered_articles:
+            if article.source in outlet_articles_map:
+                outlet_articles_map[article.source].append(article)
+        
+        # Sort Outlets
+        sorted_outlets = sorted(outlets, key=lambda o: max([a.relevance_score for a in outlet_articles_map[o.name]] or [0]), reverse=True)
+        
+        for outlet in sorted_outlets:
+            arts = outlet_articles_map.get(outlet.name, [])
+            if not arts: continue
+            
+            # Sort Articles
+            arts.sort(key=lambda x: x.relevance_score, reverse=True)
+            
+            # Outlet Header
+            table_html += f"""
+            <div style="margin-top: 32px; margin-bottom: 16px; border-bottom: 1px solid #334155; padding-bottom: 8px;">
+                <h3 style="margin: 0; font-size: 1.4rem; color: #f8fafc;">
+                    <a href="{outlet.url}" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: bold;">{outlet.name}</a>
+                    <span style="color: #94a3b8; font-size: 1rem; font-weight: normal; margin-left: 10px;">({outlet.city})</span>
+                    <span class="scraper-debug-trigger" data-url="{outlet.url}" style="cursor: pointer; font-size: 0.8em; margin-left: 8px; vertical-align: middle; opacity: 0.5;" title="Debug Scraper Rules">🔧</span>
+                </h3>
+            </div>
+            """
+                
+            # Table Header
+            table_html += """
+            <table style="width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.95rem; margin-bottom: 24px; border: 1px solid #334155; border-radius: 6px; overflow: hidden;">
+                <thead style="background-color: #1e293b; color: #e2e8f0;">
+                    <tr>
+                        <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #334155;">Assess</th>
+                        <th style="padding: 12px 16px; text-align: center; font-weight: 600; border-bottom: 1px solid #334155;">AI Check</th>
+                        <th style="padding: 12px 16px; text-align: center; font-weight: 600; border-bottom: 1px solid #334155;">Date</th>
+                        <th style="padding: 12px 16px; text-align: center; font-weight: 600; border-bottom: 1px solid #334155;">Topic</th>
+                        <th style="padding: 12px 16px; text-align: left; font-weight: 600; border-bottom: 1px solid #334155;">Article</th>
+                    </tr>
+                </thead>
+                <tbody style="background-color: #0f172a;">
+            """
+            
+            for art in arts:
+                s = art.scores
+                
+                topic_display = f"{s.get('topic', 0)}"
+                
+                date_color = "#4ade80" if art.relevance_score > 0 else "#7f1d1d"
+                date_display = f"<span style='color: {date_color}; font-weight: bold;'>{art.date_str}</span>" if art.date_str else f"<span style='color: #7f1d1d;'>N/A</span>"
+                
+                # Add Debug Trigger to Date
+                date_display += f"""<span class="scraper-debug-trigger" data-url="{art.url}" style="cursor: pointer; margin-left: 6px; font-size: 0.8em; opacity: 0.6;" title="Debug Date Extraction">🔧</span>"""
+
+                # Score Styling
+                if art.relevance_score > 80:
+                    score_bg = "#052e16" 
+                    score_text = "#4ade80" 
+                    score_border = "#15803d"
+                elif art.relevance_score > 50:
+                    score_bg = "#422006" 
+                    score_text = "#facc15" 
+                    score_border = "#a16207"
+                else:
+                    score_bg = "#450a0a" 
+                    score_text = "#f87171" 
+                    score_border = "#b91c1c"
+                
+                # Escape for HTML attributes
+                safe_url = html.escape(art.url)
+                safe_title = html.escape(art.title)
+
+                score_badge = f"""
+                <button class="politics-assess-trigger" 
+                        data-url="{safe_url}" 
+                        data-title="{safe_title}"
+                        style="
+                            display: inline-flex; align-items: center; gap: 4px;
+                            background-color: #1e293b; color: #94a3b8; 
+                            border: 1px solid #334155; padding: 4px 8px; 
+                            border-radius: 6px; font-weight: bold; font-size: 0.7rem; 
+                            cursor: pointer; transition: all 0.2s;
+                        "
+                        onmouseover="this.style.backgroundColor='#334155'; this.style.color='white';"
+                        onmouseout="this.style.backgroundColor='#1e293b'; this.style.color='#94a3b8';"
+                >
+                    🤖 Assess
+                </button>
+                <div class="politics-verdict" data-url="{art.url}" style="margin-top: 4px; font-size: 0.7rem; display: none;"></div>
+                """
+                
+                title_color = "#f1f5f9"
+                
+                # AI Status Column Logic
+                verdict_icon = "❓"
+                verdict_color = "#94a3b8"
+                verdict_tooltip = "Not Verified"
+                
+                if hasattr(art, 'ai_verdict'):
+                    if art.ai_verdict == "PASS":
+                        verdict_icon = "✅"
+                        verdict_color = "#4ade80"
+                        verdict_tooltip = "AI Confirmed: Fits Politics Definition"
+                    elif art.ai_verdict == "FAIL":
+                        verdict_icon = "⚠️"
+                        verdict_color = "#fbbf24"
+                        verdict_tooltip = "AI Warning: Likely Off-Topic (but shown per request)"
+                
+                ai_check_html = f"""
+                <div style="text-align: center; font-size: 1.2em; cursor: help;" title="{verdict_tooltip}">
+                    {verdict_icon}
+                </div>
+                """
+                
+                table_html += f"""
+                    <tr style="border-bottom: 1px solid #1e293b;">
+                        <td style="padding: 10px 16px; border-bottom: 1px solid #1e293b;">{score_badge}</td>
+                        <td style="padding: 10px 16px; border-bottom: 1px solid #1e293b;">{ai_check_html}</td>
+                        <td style="padding: 10px 16px; text-align: center; border-bottom: 1px solid #1e293b; font-size: 0.9rem; color: #cbd5e1;">{date_display}</td>
+                        <td style="padding: 10px 16px; text-align: center; border-bottom: 1px solid #1e293b; font-size: 0.9rem; color: #cbd5e1;">{topic_display}</td>
+                        <td style="padding: 10px 16px; border-bottom: 1px solid #1e293b;">
+                            <a href="{safe_url}" target="_blank" style="display: block; color: {title_color}; text-decoration: none; font-size: 1rem; font-weight: 500; line-height: 1.4; transition: color 0.2s;">
+                                <span style="border-bottom: 1px dotted #94a3b8;">{safe_title}</span> <span style="font-size: 0.8em; text-decoration: none;">🔗</span>
+                            </a>
+                        </td>
+                    </tr>
+                """
+            
+            table_html += "</tbody></table>"
+            
+        final_result = {
+            "digest": table_html,
+            "articles": [a.dict() for a in filtered_articles],
+            "analysis_source": analysis_source or [], 
+            "analysis_digest": [],
+            "category": req.category
+        }
+        
+        yield json.dumps({"type": "result", "payload": final_result}) + "\n"
+
+    # yield json.dumps({"type": "log", "message": "Processing..."}) + "\n" # OLD PLACEHOLDER
+    
+    return StreamingResponse(process_stream(), media_type="application/x-ndjson")
+
+# Existing Endpoint (unchanged for backward compat)
 @router.post("/outlets/digest", response_model=DigestResponse)
 async def generate_digest(req: DigestRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Aggregates news, generates summary, and performs DUAL analysis (Sources + Digest).
+    (Legacy/Simple) Aggregates news.
     """
     # 1. Fetch Outlets
     stmt = select(NewsOutlet).where(NewsOutlet.id.in_(req.outlet_ids))
     result = await db.execute(stmt)
+
     outlets = result.scalars().all()
     
     if not outlets:
@@ -1275,6 +1788,19 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
     # Map articles to outlets for the table
     outlet_articles_map = {o.name: [] for o in outlets}
 
+    # 0. Timeframe Calculation
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    cutoff_date = now - timedelta(days=1) # Default 24h
+    if req.timeframe == "3days":
+        cutoff_date = now - timedelta(days=3)
+    elif req.timeframe == "1week":
+        cutoff_date = now - timedelta(days=7)
+    
+    # Reset cutoff to start of day? No, rolling window is fine or user preference.
+    # Let's clean it to be strictly comparative.
+
+
     # 1. Processing & Scoring
     filtered_articles = [] # Initialize list
 
@@ -1289,7 +1815,13 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
         # SPAM BLOCK
         if any(d in article.url for d in BLOCKED_DOMAINS): continue
         # CATEGORY BLOCK
-        if "/category/" in article.url or "/page/" in article.url or "/tag/" in article.url or "/eticheta/" in article.url: continue
+        if "/category/" in article.url or "/page/" in article.url or "/tag/" in article.url or "/eticheta/" in article.url or "/author/" in article.url or "/autor/" in article.url: continue
+        
+        # Find Source Outlet for strict filtering
+        source_outlet = next((o for o in outlets if o.name == article.source), None)
+        
+        # Filter out anchor links on same page
+        if source_outlet and "#" in article.url and article.url.split("#")[0] == source_outlet.url: continue
 
         # SCORING
         # FACTOR 1: TOPIC (MAX ~90 pts)
@@ -1336,16 +1868,32 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
              source_outlet = next((o for o in outlets if o.name == article.source), None)
              if source_outlet: geo_score = 35 
 
-        # FACTOR 3: DATE (30 pts)
+        # FACTOR 3: DATE (Strict Filtering)
         date_score = 0
-        if article.date_str:
-             date_score = 30
-        else:
-             date_score = 10 
+        is_within_timeframe = False
         
-        # Remove Geo Score from Total (User Confusion Fix)
-        # total_score = topic_score + geo_score + date_score
-        total_score = topic_score + date_score
+        if article.date_str:
+             try:
+                 # Auto-detect format (YYYY-MM-DD usually)
+                 # fast parse
+                 d_obj = datetime.strptime(article.date_str, "%Y-%m-%d")
+                 if d_obj >= cutoff_date:
+                     date_score = 30
+                     is_within_timeframe = True
+             except:
+                 pass
+        
+        # User Rule: 
+        # "if the date of an article falls within the digest time frame then multiply the topic-score by 1"
+        # "If the date falls outside of the time-frame or the date is N/A the the score is 0"
+        
+        if is_within_timeframe:
+             # Valid Date
+             total_score = topic_score + date_score
+        else:
+             # Invalid / Old Date
+             total_score = 0
+
         article.relevance_score = int(total_score)
         article.scores = {"topic": topic_score, "geo": geo_score, "date": date_score}
         
@@ -1362,27 +1910,45 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
             # (Runs for any topic >= 20, even if date check failed)
             try:
                  print(f"Rescuing Date for: {article.title}")
-                 # We need a client. We can create one or reuse. Creating new for simplicity here since it's sporadic.
                  async with httpx.AsyncClient() as client:
                       resp = await client.get(article.url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                       if resp.status_code == 200:
-                           rescued_date = await extract_date_with_ai(resp.text, article.url, current_user.gemini_api_key)
-                           if rescued_date:
-                                print(f"  -> Rescued! Found: {rescued_date}")
-                                article.date_str = rescued_date
-                                # Bump Score
-                                # article.score does not exist (typo), removed to fix crash
-                                article.relevance_score += 20
-                                article.scores['date'] = 30
-                                # Now it qualifies for AI verification or basic inclusion
-                                candidates_for_ai.append(article)
+                           rescued_date = await scraper_engine.extract_date_with_ai(resp.text, article.url, current_user.gemini_api_key)
+                           
+                           if rescued_date and "429" in rescued_date:
+                                # RATE LIMIT HIT
+                                print(f"  -> Rate Limit 429: {rescued_date}")
+                                analysis_source.append(KeywordData(word="RATE_LIMIT", importance=1, type="System:RateLimit", sentiment="Warning")) # Hack to signal frontend
+                           elif rescued_date:
+                                # Validate Rescued Date against Cutoff!
+                                try:
+                                    d_obj = datetime.strptime(rescued_date, "%Y-%m-%d")
+                                    if d_obj >= cutoff_date:
+                                         print(f"  -> Rescued Valid Date: {rescued_date}")
+                                         article.date_str = rescued_date
+                                         # Bump Score
+                                         article.relevance_score = topic_score + 30 + 20 # Score reset: Topic + Date(30) + RescueBonus(20)
+                                         article.scores['date'] = 30
+                                         # Now it qualifies for AI verification or basic inclusion
+                                         candidates_for_ai.append(article)
+                                    else:
+                                         print(f"  -> Rescued OLD Date: {rescued_date} (Too Old)")
+                                         article.date_str = rescued_date
+                                         article.relevance_score = 0 # STRICT: It's old, so 0 score.
+                                         filtered_articles.append(article) # Include as "Old" reference
+                                except:
+                                     pass
                            else:
                                 # Failed Rescue, still include as fallback if topic is valid
+                                article.relevance_score = 0 # No confirmed date = 0 score
                                 filtered_articles.append(article)
                       else:
+                           article.relevance_score = 0
                            filtered_articles.append(article)
             except Exception as e:
                  print(f"Rescue Failed: {e}")
+                 # Fallback
+                 article.relevance_score = 0 
                  filtered_articles.append(article)
 
         elif article.relevance_score > 30 and topic_score > 10:
@@ -1413,7 +1979,12 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
 
     # 2. Build HTML Table (Dark Mode Optimized)
     # REMOVED LOC COLUMN
-    table_html = f"<h1 style='color: #e2e8f0; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px;'>Deep Analysis: {req.category} ({req.timeframe})</h1>"
+    
+    start_str = cutoff_date.strftime("%b %d")
+    end_str = now.strftime("%b %d")
+    period_label = f"{start_str} - {end_str}"
+    
+    table_html = f"<h1 style='color: #e2e8f0; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px;'>Deep Analysis: {req.category} <span style='font-size:0.6em; color:#94a3b8;'>({period_label})</span></h1>"
     
     for outlet in outlets:
         articles = outlet_articles_map.get(outlet.name, [])
@@ -1449,8 +2020,10 @@ async def generate_digest(req: DigestRequest, current_user: User = Depends(get_c
             s = art.scores
             
             # Icons & Text
-            date_icon = "✅" if s['date'] >= 30 else "⚠️"
-            date_display = f"{date_icon} {art.date_str}" if art.date_str else f"{date_icon} N/A"
+            date_icon = "✅" if s['date'] >= 30 and art.relevance_score > 0 else "⚠️"
+            
+            date_color = "#4ade80" if art.relevance_score > 0 else "#7f1d1d" # Green vs Bordeaux Red
+            date_display = f"<span style='color: {date_color}; font-weight: bold;'>{art.date_str}</span>" if art.date_str else f"<span style='color: #7f1d1d;'>N/A</span>"
             
             # Topic Display Logic
             # Check if this article was in the "AI Verified" batch

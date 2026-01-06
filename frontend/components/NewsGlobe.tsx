@@ -4,7 +4,8 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import * as turf from '@turf/turf';
 import api from '@/lib/api'; // Use the axios instance with Auth interceptor
-import { Sliders, X } from 'lucide-react';
+import { Sliders, X, Wrench, Search, Map, Calendar, Settings, ChevronDown, ChevronRight, List, Info, Loader2, FileText } from 'lucide-react';
+import ScraperDebugger from './ScraperDebugger';
 import ReactMarkdown from 'react-markdown';
 
 // Dynamically import Globe to avoid SSR issues
@@ -16,6 +17,18 @@ const Globe = dynamic(() => import('react-globe.gl'), {
 interface NewsGlobeProps {
     onCountrySelect?: (countryName: string, countryCode: string) => void;
 }
+
+const isDateCurrent = (extractedDate: string) => {
+    if (!extractedDate) return false;
+    try {
+        const d = new Date(extractedDate);
+        if (isNaN(d.getTime())) return false;
+        const now = new Date();
+        const diff = now.getTime() - d.getTime();
+        // Fresh if within 72 hours (3 days)
+        return diff < 72 * 60 * 60 * 1000;
+    } catch { return false; }
+};
 
 export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
     const globeEl = useRef<any>(null);
@@ -33,6 +46,7 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
     const [selectedCountry, setSelectedCountry] = useState<any | null>(null);
     const [cities, setCities] = useState<any[]>([]);
     const [hoverPoint, setHoverPoint] = useState<any | null>(null);
+    const [digestData, setDigestData] = useState<any>(null);
 
     // Discovery Features
     const [discoveredCities, setDiscoveredCities] = useState<string[]>([]);
@@ -78,14 +92,9 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
     const [isGeneratingDigest, setIsGeneratingDigest] = useState(false);
     const [cityInfo, setCityInfo] = useState<any>(null);
 
-    interface DigestData {
-        digest: string;
-        articles: any[];
-        analysis_source?: any[];
-        analysis_digest?: any[];
-    }
+    // Logging State for Digest Generation
+    const [progressLog, setProgressLog] = useState('');
 
-    const [digestData, setDigestData] = useState<DigestData | null>(null);
     const [isSaving, setIsSaving] = useState(false);
     const [savedDigests, setSavedDigests] = useState<any[]>([]);
     const [activeSideTab, setActiveSideTab] = useState<'sources' | 'digests'>('sources');
@@ -105,6 +114,118 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
             console.error("Failed to load digests", err);
         }
     };
+    // Scraper Debugger State
+    const [scraperDebuggerOpen, setScraperDebuggerOpen] = useState(false);
+    const [debugTarget, setDebugTarget] = useState<{ url: string, domain: string } | null>(null);
+
+    const handleOpenDebugger = (url: string) => {
+        try {
+            const domain = new URL(url).hostname.replace('www.', '');
+            setDebugTarget({ url, domain });
+            setScraperDebuggerOpen(true);
+        } catch (e) {
+            console.error("Invalid URL for debugger", url);
+        }
+    };
+
+
+
+
+    const handleRuleSaving = () => {
+        if (!debugTarget || !digestData) return;
+
+        let newDigestHtml = digestData.digest;
+        if (typeof document !== 'undefined') {
+            try {
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = newDigestHtml;
+
+                const triggers = tempDiv.querySelectorAll(`.scraper-debug-trigger[data-url="${debugTarget.url}"]`);
+                triggers.forEach((trigger: any) => {
+                    if (trigger.previousElementSibling) {
+                        trigger.previousElementSibling.innerHTML = "⏳";
+                        trigger.previousElementSibling.className = "animate-spin inline-block";
+                    }
+                });
+
+                newDigestHtml = tempDiv.innerHTML;
+            } catch (e) { console.warn("Saving spinner patch failed", e); }
+        }
+
+        setDigestData({
+            ...digestData,
+            digest: newDigestHtml
+        });
+    }
+
+    // Live Rule Update Handler
+    const handleRuleSaved = async (domain: string) => {
+        if (!digestData || !digestData.articles) return;
+
+        const relevantArticles = digestData.articles.filter((art: any) => {
+            try {
+                return new URL(art.url).hostname.replace('www.', '') === domain;
+            } catch (e) { return false; }
+        });
+
+        if (relevantArticles.length === 0) return;
+
+        const updatedArticles = [...digestData.articles];
+        let newDigestHtml = digestData.digest;
+
+        for (const art of relevantArticles) {
+            try {
+                // Apply Rule Test
+                const response = await api.post('/scraper/test', { url: art.url });
+
+                if (response.data.status === 'success' && response.data.extracted_date) {
+                    const idx = updatedArticles.findIndex(a => a.url === art.url);
+                    if (idx !== -1) {
+                        const newDate = response.data.extracted_date;
+                        const isFresh = isDateCurrent(newDate);
+
+                        updatedArticles[idx] = {
+                            ...updatedArticles[idx],
+                            date_str: newDate,
+                            scores: {
+                                ...updatedArticles[idx].scores,
+                                is_fresh: isFresh,
+                                is_old: !isFresh
+                            },
+                            relevance_score: isFresh ? updatedArticles[idx].relevance_score : 0
+                        };
+
+                        // HTML Patch
+                        if (typeof document !== 'undefined') {
+                            try {
+                                const tempDiv = document.createElement('div');
+                                tempDiv.innerHTML = newDigestHtml;
+                                const trigger = tempDiv.querySelector(`.scraper-debug-trigger[data-url="${CSS.escape(art.url)}"]`);
+                                if (trigger && trigger.previousElementSibling) {
+                                    trigger.previousElementSibling.textContent = newDate;
+                                    trigger.previousElementSibling.className = ""; // remove spin
+                                    // Color logic
+                                    (trigger.previousElementSibling as HTMLElement).style.color = isFresh ? "#4ade80" : "#7f1d1d";
+                                }
+                                newDigestHtml = tempDiv.innerHTML;
+                            } catch (e) { console.warn("HTML Patch failed", e); }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn("Failed to re-scrape", art.url, e);
+            }
+        }
+
+        setDigestData({
+            ...digestData,
+            articles: updatedArticles,
+            digest: newDigestHtml
+        });
+    };
+
+    // Actually, backend sets SCORE to 0 if invalid. Let's use that signal for reliability.
+    const isArticleValid = (art: any) => art.relevance_score > 0;
 
     const handleSaveDigest = async () => {
         if (!digestData) return;
@@ -128,6 +249,88 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
             setErrorMessage("Failed to save digest.");
         } finally {
             setIsSaving(false);
+        }
+    };
+
+    const handleGenerateDigest = async () => {
+        if (selectedOutletIds.length === 0) {
+            setErrorMessage("Please select at least one outlet.");
+            return;
+        }
+        setIsGeneratingDigest(true);
+        setErrorMessage(null);
+        setDigestData(null);
+        setProgressLog('Connecting to stream...');
+
+        try {
+            // Retrieve token from storage/api helper if needed
+            const token = localStorage.getItem('token');
+
+            const response = await fetch(`${api.defaults.baseURL}/outlets/digest/stream`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
+                body: JSON.stringify({
+                    outlet_ids: selectedOutletIds,
+                    category: selectedCategory,
+                    timeframe: selectedTimeframe
+                })
+            });
+
+            if (!response.body) throw new Error("No stream body");
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let done = false;
+            let buffer = '';
+
+            while (!done) {
+                const { value, done: doneReading } = await reader.read();
+                done = doneReading;
+                const chunkValue = decoder.decode(value || new Uint8Array(), { stream: !done });
+
+                buffer += chunkValue;
+                const lines = buffer.split('\n');
+
+                // Keep the last line in the buffer as it might be incomplete
+                // unless we are done, in which case process everything.
+                buffer = done ? '' : lines.pop() || '';
+
+                for (const line of lines) {
+                    if (line.trim() === '') continue;
+                    try {
+                        const msg = JSON.parse(line);
+                        if (msg.type === 'log') {
+                            setProgressLog(`> ${msg.message}`);
+                        } else if (msg.type === 'result') {
+                            const data = msg.payload;
+                            console.log("Received Digest Result:", data); // Debug
+                            setDigestData(data);
+                            setActiveModalTab('report');
+                            setShowOutletPanel(true);
+
+                            if (data.analysis_source) {
+                                const hasRateLimit = data.analysis_source.some((k: any) => k.type === "System:RateLimit");
+                                if (hasRateLimit) {
+                                    alert("⚠️ Rate Limit Warning: Some articles could not be fully analyzed because the AI quota was exceeded. The digest is partial.");
+                                }
+                            }
+                        } else if (msg.type === 'error') {
+                            setErrorMessage(msg.message);
+                        }
+                    } catch (e) {
+                        console.warn("Stream parse error for line:", line.substring(0, 50) + "...", e);
+                    }
+                }
+            }
+
+        } catch (err: any) {
+            console.error("Digest generation failed", err);
+            setErrorMessage(err.message || 'Failed to generate digest');
+        } finally {
+            setIsGeneratingDigest(false);
         }
     };
 
@@ -589,29 +792,7 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
         );
     };
 
-    const handleGenerateDigest = () => {
-        if (selectedOutletIds.length === 0) return;
-        setIsGeneratingDigest(true);
-        setDigestData(null);
 
-        api.post('/outlets/digest', {
-            outlet_ids: selectedOutletIds,
-            category: selectedCategory,
-            timeframe: selectedTimeframe
-        })
-            .then(res => {
-                const data = res.data;
-                if (data.digest) {
-                    setDigestData(data);
-                } else {
-                    setDigestData({ digest: "Failed to generate digest.", articles: [] });
-                }
-            })
-            .catch(err => {
-                setDigestData({ digest: `Error: ${err.message}`, articles: [] });
-            })
-            .finally(() => setIsGeneratingDigest(false));
-    };
 
     const handleDeleteOutlet = (e: any, outletId: number) => {
         e.stopPropagation();
@@ -677,6 +858,40 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
                 setErrorMessage(err.response?.data?.detail || err.message);
             })
             .finally(() => setIsImporting(false));
+    };
+
+    const handleAssessArticle = (url: string, title: string, btnElement: HTMLElement) => {
+        // Optimistic UI
+        btnElement.textContent = "⏳ Analyzing...";
+        btnElement.style.color = "#fbbf24"; // Amber
+        // Disable
+        btnElement.style.pointerEvents = "none";
+
+        api.post('/outlets/assess_article', { url, title })
+            .then(res => {
+                const data = res.data;
+                const isPolitics = data.is_politics;
+                const color = isPolitics ? '#4ade80' : '#f87171'; // Green : Red
+                const icon = isPolitics ? '✅' : '❌';
+
+                // Update Button to Result
+                btnElement.innerHTML = `${icon} ${data.confidence}%`;
+                btnElement.style.borderColor = color;
+                btnElement.style.color = color;
+
+                // Show Verdict Div
+                const verdictDiv = btnElement.nextElementSibling as HTMLElement;
+                if (verdictDiv) {
+                    verdictDiv.style.display = 'block';
+                    verdictDiv.style.color = color;
+                    verdictDiv.innerHTML = `<b>${isPolitics ? "POLITICS" : "IGNORED"}</b>: ${data.reasoning} <br/> <span style="opacity:0.7; font-size:0.6rem;">[${data.labels.join(', ')}]</span>`;
+                }
+            })
+            .catch(err => {
+                btnElement.textContent = "Error";
+                btnElement.style.pointerEvents = "auto";
+                console.error(err);
+            });
     };
 
     // ... (Add manual outlet implementation similar to above using api.post)
@@ -806,13 +1021,65 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
 
                             <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
                                 {activeModalTab === 'report' ? (
-                                    <div className="prose prose-invert prose-lg max-w-none prose-headings:text-blue-300 prose-headings:font-bold prose-h3:text-xl prose-h3:mt-6 prose-p:text-justify prose-p:leading-relaxed prose-a:text-blue-400 prose-a:font-semibold prose-a:no-underline hover:prose-a:underline">
-                                        <div dangerouslySetInnerHTML={{ __html: digestData.digest }} />
+                                    <div className="flex flex-col gap-8">
+                                        <div className="border-b border-white/10 pb-4 mb-2">
+                                            <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400">
+                                                News Digest: {selectedCategory}
+                                            </h2>
+                                            <p className="text-gray-400 text-sm mt-1">
+                                                Timeframe: <span className="text-white font-medium">
+                                                    {(() => {
+                                                        const now = new Date();
+                                                        const start = new Date();
+                                                        if (selectedTimeframe === '24h') start.setDate(now.getDate() - 1);
+                                                        if (selectedTimeframe === '3days') start.setDate(now.getDate() - 3);
+                                                        if (selectedTimeframe === '1week') start.setDate(now.getDate() - 7);
+
+                                                        const fmt = (d: Date) => `${d.getDate()}.${d.getMonth() + 1}.${d.getFullYear()}`;
+                                                        return `${fmt(start)} - ${fmt(now)}`;
+                                                    })()}
+                                                </span>
+                                            </p>
+                                        </div>
+
+                                        {/* HTML Digest Table (Generated by Backend) */}
+                                        <div
+                                            className="prose prose-invert max-w-none prose-sm prose-headings:text-blue-300 prose-a:text-blue-400 hover:prose-a:text-blue-300 prose-td:align-top"
+                                            dangerouslySetInnerHTML={{ __html: digestData.digest }}
+                                            onClick={(e) => {
+                                                // Event Delegation for Scraper Debugger Triggers injected in HTML
+                                                const target = e.target as HTMLElement;
+
+                                                // Scraper Debugger
+                                                const trigger = target.closest('.scraper-debug-trigger');
+                                                if (trigger) {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    const url = trigger.getAttribute('data-url');
+                                                    if (url) handleOpenDebugger(url);
+                                                }
+
+                                                // Politics Assessment
+                                                const assessTrigger = target.closest('.politics-assess-trigger');
+                                                if (assessTrigger) {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    const url = assessTrigger.getAttribute('data-url');
+                                                    const title = assessTrigger.getAttribute('data-title');
+                                                    if (url && title) {
+                                                        const btn = assessTrigger as HTMLElement;
+                                                        handleAssessArticle(url, title, btn);
+                                                    }
+                                                }
+                                            }}
+                                        />
                                     </div>
                                 ) : (
                                     <div className="min-h-full flex flex-col">
                                         <div className="flex justify-between items-center mb-6">
-                                            <h3 className="text-xl font-bold text-slate-300">Semantic Cloud</h3>
+                                            <h3 className="text-xl font-bold text-slate-300">
+                                                Semantic Cloud <span className="text-slate-500 text-sm font-normal ml-2">({selectedTimeframe})</span>
+                                            </h3>
                                             <div className="flex bg-slate-700/50 rounded-lg p-1 border border-slate-600">
                                                 <button
                                                     onClick={() => setAnalyticsMode('source')}
@@ -941,27 +1208,11 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
                                         })()}
                                     </div>
                                 )}
-
-                                {digestData.articles && digestData.articles.length > 0 && (
-                                    <div className="mt-8 pt-8 border-t border-slate-800">
-                                        <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-4">Source Articles</h3>
-                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                            {digestData.articles.map((article: any, i: number) => (
-                                                <a key={i} href={article.url} target="_blank" rel="noopener noreferrer"
-                                                    className="block p-3 rounded bg-slate-800/50 hover:bg-slate-800 border border-slate-700 hover:border-blue-500 transition-all text-xs text-slate-300 truncate">
-                                                    {article.title || article.url}
-                                                </a>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
                             </div>
                         </div>
                     </div>
                 )
             }
-
-
             <Globe
                 ref={globeEl}
                 globeImageUrl={mapStyle}
@@ -1182,7 +1433,6 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
                                     <button onClick={() => setShowOutletPanel(false)} className="text-gray-400 hover:text-white">✕</button>
                                 </div>
                             </div>
-
                             {cityInfo && (
                                 <div className="text-xs text-slate-400 space-y-2 animate-in slide-in-from-left-2 fade-in duration-300">
                                     <div className="flex flex-wrap gap-2 text-[10px] items-center">
@@ -1218,16 +1468,20 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
 
                             {/* Timeframe Selector */}
                             <div className="flex gap-2 bg-slate-900/40 p-1 rounded-lg border border-slate-700/50 my-2">
-                                {['24h', '3 Days', '7 Days'].map((tf) => (
+                                {[
+                                    { label: '24h', value: '24h' },
+                                    { label: '3 Days', value: '3days' },
+                                    { label: '7 Days', value: '1week' }
+                                ].map((tf) => (
                                     <button
-                                        key={tf}
-                                        onClick={() => setSelectedTimeframe(tf)}
-                                        className={`flex-1 py-1 text-[10px] uppercase font-bold rounded text-center transition-all ${selectedTimeframe === tf
+                                        key={tf.value}
+                                        onClick={() => setSelectedTimeframe(tf.value)}
+                                        className={`flex-1 py-1 text-[10px] uppercase font-bold rounded text-center transition-all ${selectedTimeframe === tf.value
                                             ? 'bg-blue-600/20 text-blue-400 border border-blue-500/50 shadow-[0_0_10px_rgba(59,130,246,0.2)]'
                                             : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
                                             }`}
                                     >
-                                        {tf}
+                                        {tf.label}
                                     </button>
                                 ))}
                             </div>
@@ -1236,13 +1490,33 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
                                 <button
                                     onClick={handleGenerateDigest}
                                     disabled={isGeneratingDigest || selectedOutletIds.length === 0}
-                                    className="flex-1 py-2 bg-blue-600 text-white rounded font-bold text-sm hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-lg shadow-lg shadow-blue-900/40 transition-all text-base border border-blue-500/30 flex justify-center items-center gap-2 h-14 min-w-[300px]"
                                 >
-                                    {isGeneratingDigest ? 'Generating...' : 'Generate Digest'}
+                                    {isGeneratingDigest ? (
+                                        <>
+                                            <div className="flex flex-col items-center">
+                                                <span className="flex items-center gap-2">
+                                                    <Loader2 className="w-5 h-5 animate-spin" />
+                                                    Generare Digest...
+                                                </span>
+                                                {progressLog && (
+                                                    <span className="text-xs text-blue-200 mt-1 font-mono opacity-80 animate-pulse whitespace-nowrap min-w-[250px] text-center">
+                                                        {progressLog.length > 40 ? progressLog.substring(0, 40) + '...' : progressLog}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <FileText className="w-5 h-5" />
+                                            Generate Digest
+                                        </>
+                                    )}
                                 </button>
                             </div>
 
                             {/* Sidebar Tabs */}
+
                             <div className="flex border-b border-slate-700 mt-4">
                                 <button
                                     onClick={() => setActiveSideTab('sources')}
@@ -1426,10 +1700,25 @@ export default function NewsGlobe({ onCountrySelect }: NewsGlobeProps) {
                                     )}
                                 </div>
                             )}
-                        </div >
-                    </div >
+                        </div>
+                    </div>
+                )}
+
+
+            {
+                debugTarget && (
+                    <ScraperDebugger
+                        isOpen={scraperDebuggerOpen}
+                        onClose={() => setScraperDebuggerOpen(false)}
+                        initialUrl={debugTarget.url}
+                        domain={debugTarget.domain}
+
+                        onSave={handleRuleSaved}
+                        onSaving={handleRuleSaving}
+                    />
                 )
             }
-        </div >
+        </div>
+
     );
 }
