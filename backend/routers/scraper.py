@@ -83,20 +83,20 @@ async def test_extraction(req: TestExtractionRequest, db: Session = Depends(get_
     If rule_config is provided, it uses that ephemeral config.
     If not, it looks up DB/Registry for the URL's domain.
     """
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,uk;q=0.8",
-            "Referer": "https://www.google.com/",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Sec-Fetch-User": "?1",
-        }
-        async with httpx.AsyncClient(follow_redirects=True, verify=False, http2=True) as client:
-            try:
-                resp = await client.get(req.url, headers=headers, timeout=15)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,uk;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-User": "?1",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, verify=False, http2=True) as client:
+        try:
+            resp = await client.get(req.url, headers=headers, timeout=15)
             if resp.status_code != 200:
                 raise HTTPException(status_code=400, detail=f"Failed to fetch URL: Status {resp.status_code}")
             
