@@ -8,7 +8,7 @@ import { useAuthStore } from '@/lib/store';
 import { Sliders, X, Save, Key, Loader2, LogOut, StopCircle, Languages, Wrench, Search, Map, Calendar, Settings, ChevronDown, ChevronRight, List, Info, FileText, Sparkles } from 'lucide-react';
 import ScraperDebugger from './ScraperDebugger';
 import ReactMarkdown from 'react-markdown';
-import { CAPITALS } from '../data/capitals';
+import { CAPITALS } from '../utils/capitals';
 import DigestReportRenderer from './DigestReportRenderer';
 import UIMarquee from './UIMarquee';
 
